@@ -59,26 +59,30 @@ type NetworkSnapshot struct {
 }
 
 type AIAnalysis struct {
-	Uninteresting []struct {
-		Source      string   `json:"source"`
-		Destination []string `json:"destination"`
-		Description string   `json:"description"`
-	} `json:"uninteresting"`
-	Anomalies []struct {
-		Source      string   `json:"source"`
-		Destination []string `json:"destination"`
-		Description string   `json:"description"`
-	} `json:"anomalies"`
+	Ignore []struct {
+		Description string `json:"description"`
+		Details     []struct {
+			Source      string `json:"source"`
+			Destination string `json:"destination"`
+		} `json:"details"`
+	} `json:"IGNORE"`
 	Bad []struct {
-		Source      string   `json:"source"`
-		Destination []string `json:"destination"`
-		Description string   `json:"description"`
-	} `json:"bad"`
+		Description string `json:"description"`
+		Details     struct {
+			Source       string `json:"source"`
+			Destination  string `json:"destination"`
+			SessionCount int    `json:"session_count"`
+			TotalBytes   string `json:"total_bytes"`
+		} `json:"details"`
+	} `json:"BAD"`
+	Summary string `json:"SUMMARY"`
 }
 
 type OpenAIResponse struct {
+	ID      string `json:"id"`
 	Choices []struct {
 		Message struct {
+			Role    string `json:"role"`
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
@@ -92,6 +96,8 @@ var (
 	sessions      = make(map[string]Session)
 	sessionMutex  = &sync.RWMutex{}
 	logger        = logrus.New()
+	aiSessionID   string
+	chatHistory   []map[string]string
 )
 
 func main() {
@@ -207,11 +213,32 @@ func processPacket(packet gopacket.Packet) {
 		return
 	}
 
+	// Determine which IP is the client and which is the server
+	srcIP := networkLayer.NetworkFlow().Src().String()
+	dstIP := networkLayer.NetworkFlow().Dst().String()
+
+	// If destination port is well-known (0-1023) and source port is not,
+	// then the source is the client and destination is the server
+	if dstPort <= 1023 && srcPort > 1023 {
+		// Keep as is
+	} else if srcPort <= 1023 && dstPort > 1023 {
+		// Swap source and destination
+		srcIP, dstIP = dstIP, srcIP
+		srcPort, dstPort = dstPort, srcPort
+	} else {
+		// If both ports are well-known or both are not,
+		// assume the lower port is the server
+		if srcPort > dstPort {
+			srcIP, dstIP = dstIP, srcIP
+			srcPort, dstPort = dstPort, srcPort
+		}
+	}
+
 	// Create session key
 	sessionKey := fmt.Sprintf("%s:%d:%s:%d",
-		networkLayer.NetworkFlow().Src().String(),
+		srcIP,
 		srcPort,
-		networkLayer.NetworkFlow().Dst().String(),
+		dstIP,
 		dstPort)
 
 	// Update or create session
@@ -219,9 +246,9 @@ func processPacket(packet gopacket.Packet) {
 	session, exists := sessions[sessionKey]
 	if !exists {
 		session = Session{
-			SourceIP:        networkLayer.NetworkFlow().Src().String(),
+			SourceIP:        srcIP,
 			SourcePort:      srcPort,
-			DestinationIP:   networkLayer.NetworkFlow().Dst().String(),
+			DestinationIP:   dstIP,
 			DestinationPort: dstPort,
 			Protocol:        transportLayer.LayerType().String(),
 			StartTime:       time.Now(),
@@ -235,7 +262,7 @@ func processPacket(packet gopacket.Packet) {
 
 	// Update byte counts
 	packetLength := len(packet.Data())
-	if networkLayer.NetworkFlow().Src().String() == session.SourceIP {
+	if networkLayer.NetworkFlow().Src().String() == srcIP {
 		session.BytesSent += int64(packetLength)
 	} else {
 		session.BytesReceived += int64(packetLength)
@@ -278,7 +305,7 @@ func compressSessions(sessions map[string]Session) []CompressedSession {
 
 	for _, session := range sessions {
 		// Create a key for compression based on source IP and destination IP:port
-		// Ignore source port for ephemeral ports
+		// For single sessions, include the source port in the key
 		key := fmt.Sprintf("%s:%s:%d",
 			session.SourceIP,
 			session.DestinationIP,
@@ -288,7 +315,7 @@ func compressSessions(sessions map[string]Session) []CompressedSession {
 		if !exists {
 			compressedSession = CompressedSession{
 				SourceIP:        session.SourceIP,
-				SourcePort:      0, // 0 indicates ephemeral
+				SourcePort:      session.SourcePort, // Store the actual source port
 				DestinationIP:   session.DestinationIP,
 				DestinationPort: session.DestinationPort,
 				Protocol:        session.Protocol,
@@ -306,6 +333,8 @@ func compressSessions(sessions map[string]Session) []CompressedSession {
 			if session.LastSeen.After(compressedSession.LastSeen) {
 				compressedSession.LastSeen = session.LastSeen
 			}
+			// If we have multiple sessions, mark the source port as 0 to indicate it should be displayed as "ephemeral"
+			compressedSession.SourcePort = 0
 		}
 		compressed[key] = compressedSession
 	}
@@ -404,56 +433,59 @@ func printDebugInfo(snapshot NetworkSnapshot, apiStatus string) {
 }
 
 func sendSnapshot(snapshot NetworkSnapshot) string {
-	prompt := fmt.Sprintf(`You are a network security expert analyzing a 30-second snapshot of network sessions, SNI captures, and DNS from a network interface. 
- 
-This is part of an ongoing monitoring system where we send you regular snapshots to help identify potential security threats. We will keep this session consistent so we can allow you to have context to determine what's happening.
-Your task is to:
-1. Identify things that appear completely normal and can be safely ignored (uninteresting)
-2. Identify anything that shows potential security concerns for you to continue to track but don't freak out about them (anomalies)
-3. Identify really bad stuff over time or actively (bad)
+	// Initialize chat history if empty
+	if len(chatHistory) == 0 {
+		systemPrompt := `You are a network security expert analyzing network traffic. Categorize traffic into:
+1. "IGNORE": typical patterns with source/destination pairs
+2. anomalies: unusual patterns with session counts and bytes, this something you will track with context because it might not be serious now but worth nothing and watching.
+3. "BAD": malicious activity with session counts and bytes
 
-For each session, consider:
-- usage and protocol patterns
-- Large traffic volume and patterns to dangerous places
-- SNI hosts that are bad or missing
-- DNS hosts that are bad
-- IPs that are bad
-- Source and destination relationships
+We will be sending you a snapshot of DNS, SNI, and sessions tables every 30 seconds so keep this history and build context on it.
 
-We will use your response to:
-- Remove uninteresting sessions from our monitoring
-- Focus our attention on bad things
-- Track the evolution of suspicious patterns over time
+Respond in this exact JSON format:
+{
+    "IGNORE": [{"description": "pattern", "details": [{"source": "ip", "destination": "ip"}]}],
+    "BAD": [{"description": "threat", "details": {"source": "ip", "destination": "ip", "session_count": N, "total_bytes": "size"}}],
+    "SUMMARY": "A short summary of the analysis"
+}`
 
-Current snapshot data:
-%s
+		chatHistory = []map[string]string{
+			{
+				"role":    "system",
+				"content": systemPrompt,
+			},
+		}
 
-Respond in JSON please`, formatSnapshot(snapshot))
+		if *debugAIMode {
+			logger.Info("\n=== Sending System Prompt to OpenAI API ===")
+			logger.Info("System Prompt:")
+			logger.Info(systemPrompt)
+			logger.Info("===========================\n")
+		}
+	}
+
+	// Add the snapshot to chat history
+	prompt := fmt.Sprintf("Analyze this network snapshot:\n%s", formatSnapshot(snapshot))
+	chatHistory = append(chatHistory, map[string]string{
+		"role":    "user",
+		"content": prompt,
+	})
 
 	if *debugMode {
 		printDebugInfo(snapshot, "Sending request to OpenAI API...")
 	}
 
 	if *debugAIMode {
-		logger.Info("\n=== Sending to OpenAI API ===")
+		logger.Info("\n=== Sending Snapshot to OpenAI API ===")
 		logger.Info("Prompt:")
 		logger.Info(prompt)
 		logger.Info("===========================\n")
 	}
 
-	// Prepare OpenAI API request
+	// Prepare OpenAI API request with full chat history
 	requestBody := map[string]interface{}{
-		"model": "gpt-4o",
-		"messages": []map[string]string{
-			{
-				"role":    "system",
-				"content": "You are a network security expert analyzing network traffic patterns.",
-			},
-			{
-				"role":    "user",
-				"content": prompt,
-			},
-		},
+		"model":    "gpt-4o",
+		"messages": chatHistory,
 	}
 
 	jsonData, err := json.Marshal(requestBody)
@@ -510,9 +542,9 @@ Respond in JSON please`, formatSnapshot(snapshot))
 	}
 
 	if *debugAIMode {
-		logger.Info("\n=== OpenAI API Response ===")
+		logger.Info("\n=== OpenAI API Snapshot Response ===")
 		logger.Info(string(body))
-		logger.Info("=========================\n")
+		logger.Info("===========================\n")
 	}
 
 	var openAIResp OpenAIResponse
@@ -527,6 +559,11 @@ Respond in JSON please`, formatSnapshot(snapshot))
 	}
 
 	if len(openAIResp.Choices) > 0 {
+		// Add the assistant's response to chat history
+		chatHistory = append(chatHistory, map[string]string{
+			"role":    "assistant",
+			"content": openAIResp.Choices[0].Message.Content,
+		})
 		return openAIResp.Choices[0].Message.Content
 	}
 	return ""
@@ -557,38 +594,29 @@ func pruneSessions(aiResponse string) {
 	sessionsToKeep := make(map[string]bool)
 
 	// Mark sessions to keep based on AI analysis
-	for _, anomaly := range analysis.Anomalies {
-		for _, dest := range anomaly.Destination {
-			key := fmt.Sprintf("%s:%s", anomaly.Source, dest)
-			sessionsToKeep[key] = true
-		}
-	}
 	for _, bad := range analysis.Bad {
-		for _, dest := range bad.Destination {
-			key := fmt.Sprintf("%s:%s", bad.Source, dest)
-			sessionsToKeep[key] = true
-		}
+		key := fmt.Sprintf("%s:%s", bad.Details.Source, bad.Details.Destination)
+		sessionsToKeep[key] = true
 	}
 
 	// Prune uninteresting sessions
 	for key := range sessions {
 		if !sessionsToKeep[key] {
-			// Check if this session is marked as uninteresting
-			isUninteresting := false
-			for _, uninteresting := range analysis.Uninteresting {
-				if uninteresting.Source == strings.Split(key, ":")[0] {
-					for _, dest := range uninteresting.Destination {
-						if dest == strings.Split(key, ":")[1] {
-							isUninteresting = true
-							break
-						}
-					}
-					if isUninteresting {
+			// Check if this session is marked as normal
+			isNormal := false
+			for _, ignore := range analysis.Ignore {
+				for _, detail := range ignore.Details {
+					normalKey := fmt.Sprintf("%s:%s", detail.Source, detail.Destination)
+					if normalKey == key {
+						isNormal = true
 						break
 					}
 				}
+				if isNormal {
+					break
+				}
 			}
-			if isUninteresting {
+			if isNormal {
 				delete(sessions, key)
 			}
 		}
@@ -609,35 +637,30 @@ func pruneSessions(aiResponse string) {
 
 	// Log AI's categorization
 	logger.Info("\nAI Analysis Summary:")
-	logger.Infof("Uninteresting sessions: %d", len(analysis.Uninteresting))
-	logger.Infof("Anomalous sessions: %d", len(analysis.Anomalies))
+	logger.Infof("Summary: %s", analysis.Summary)
+	logger.Infof("Ignored traffic groups: %d", len(analysis.Ignore))
 	logger.Infof("Bad sessions: %d", len(analysis.Bad))
 
 	// Log some example reasons
-	if len(analysis.Uninteresting) > 0 {
-		logger.Info("\nExample uninteresting sessions:")
-		for i := 0; i < min(3, len(analysis.Uninteresting)); i++ {
-			logger.Infof("- %s -> %v: %s",
-				analysis.Uninteresting[i].Source,
-				analysis.Uninteresting[i].Destination,
-				analysis.Uninteresting[i].Description)
-		}
-	}
-	if len(analysis.Anomalies) > 0 {
-		logger.Info("\nExample anomalous sessions:")
-		for i := 0; i < min(3, len(analysis.Anomalies)); i++ {
-			logger.Infof("- %s -> %v: %s",
-				analysis.Anomalies[i].Source,
-				analysis.Anomalies[i].Destination,
-				analysis.Anomalies[i].Description)
+	if len(analysis.Ignore) > 0 {
+		logger.Info("\nExample ignored traffic:")
+		for i := 0; i < min(3, len(analysis.Ignore)); i++ {
+			logger.Infof("- %s", analysis.Ignore[i].Description)
+			for j := 0; j < min(3, len(analysis.Ignore[i].Details)); j++ {
+				logger.Infof("  • %s -> %s",
+					analysis.Ignore[i].Details[j].Source,
+					analysis.Ignore[i].Details[j].Destination)
+			}
 		}
 	}
 	if len(analysis.Bad) > 0 {
 		logger.Info("\nExample bad sessions:")
 		for i := 0; i < min(3, len(analysis.Bad)); i++ {
-			logger.Infof("- %s -> %v: %s",
-				analysis.Bad[i].Source,
-				analysis.Bad[i].Destination,
+			logger.Infof("- %s -> %s (%d sessions, %s): %s",
+				analysis.Bad[i].Details.Source,
+				analysis.Bad[i].Details.Destination,
+				analysis.Bad[i].Details.SessionCount,
+				analysis.Bad[i].Details.TotalBytes,
 				analysis.Bad[i].Description)
 		}
 	}
@@ -674,9 +697,9 @@ func formatSnapshot(snapshot NetworkSnapshot) string {
 
 	// Format each session as a table row
 	for _, session := range compressedSessions {
-		srcPort := "ephemeral"
-		if session.SourcePort != 0 {
-			srcPort = fmt.Sprintf("%d", session.SourcePort)
+		srcPort := fmt.Sprintf("%d", session.SourcePort)
+		if session.Count > 1 {
+			srcPort = "ephemeral"
 		}
 
 		// Calculate average bytes per session
