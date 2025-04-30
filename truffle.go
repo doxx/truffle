@@ -100,6 +100,17 @@ var (
 	chatHistory   []map[string]string
 )
 
+// TLS record types
+const (
+	TLSHandshakeType uint8 = 22 // Handshake record type
+	TLSClientHello   uint8 = 1  // ClientHello message type
+)
+
+// TLS extension types
+const (
+	TLSExtServerName = 0
+)
+
 func main() {
 	flag.Parse()
 
@@ -268,12 +279,26 @@ func processPacket(packet gopacket.Packet) {
 		session.BytesReceived += int64(packetLength)
 	}
 
-	// Check for TLS/SNI
+	// Check for TLS
 	if tlsLayer := packet.Layer(layers.LayerTypeTLS); tlsLayer != nil {
 		if *debugMode {
 			logger.Debug("TLS packet detected")
 		}
 		session.Protocol = "TLS"
+
+		// Get the raw bytes from the TLS layer
+		payload := tlsLayer.LayerPayload()
+		if len(payload) > 0 {
+			// Try to parse the TLS handshake
+			if sni, err := parseTLSHandshake(payload); err == nil && sni != "" {
+				session.SNI = sni
+				if *debugMode {
+					logger.Debugf("Extracted SNI: %s", session.SNI)
+				}
+			} else if *debugMode && err != nil {
+				logger.Debugf("Failed to parse TLS handshake: %v", err)
+			}
+		}
 	}
 
 	// Check for DNS
@@ -442,6 +467,8 @@ func sendSnapshot(snapshot NetworkSnapshot) string {
 
 We will be sending you a snapshot of DNS, SNI, and sessions tables every 30 seconds so keep this history and build context on it.
 
+Note: exfil is only outbound connections that are long lived (multiple API session calls) and data over 100MB.
+
 Respond in this exact JSON format:
 {
     "IGNORE": [{"description": "pattern", "details": [{"source": "ip", "destination": "ip"}]}],
@@ -599,8 +626,8 @@ func pruneSessions(aiResponse string) {
 		sessionsToKeep[key] = true
 	}
 
-	// Prune uninteresting sessions
-	for key := range sessions {
+	// Prune uninteresting sessions and clear DNS/SNI
+	for key, session := range sessions {
 		if !sessionsToKeep[key] {
 			// Check if this session is marked as normal
 			isNormal := false
@@ -618,7 +645,17 @@ func pruneSessions(aiResponse string) {
 			}
 			if isNormal {
 				delete(sessions, key)
+			} else {
+				// Clear DNS and SNI for sessions we're keeping
+				session.DNSQuery = ""
+				session.SNI = ""
+				sessions[key] = session
 			}
+		} else {
+			// Clear DNS and SNI for sessions we're keeping
+			session.DNSQuery = ""
+			session.SNI = ""
+			sessions[key] = session
 		}
 	}
 
@@ -683,8 +720,8 @@ func formatSnapshot(snapshot NetworkSnapshot) string {
 	compressedSessions := compressSessions(sessions)
 
 	// Create table header
-	header := fmt.Sprintf("%-20s %-10s %-20s %-10s %-8s %-8s %-12s %-12s %-12s",
-		"Source", "SrcPort", "Destination", "DstPort", "Proto", "Sessions", "Avg Bytes", "Total Bytes", "Duration")
+	header := fmt.Sprintf("%-20s %-10s %-20s %-10s %-8s %-8s %-12s %-12s %-12s %-30s %-30s",
+		"Source", "SrcPort", "Destination", "DstPort", "Proto", "Sessions", "Avg Bytes", "Total Bytes", "Duration", "SNI", "DNS Query")
 	separator := strings.Repeat("-", len(header))
 
 	builder.WriteString(header + "\n")
@@ -712,7 +749,23 @@ func formatSnapshot(snapshot NetworkSnapshot) string {
 		// Format duration
 		durationStr := formatDuration(session.Duration)
 
-		row := fmt.Sprintf("%-20s %-10s %-20s %-10d %-8s %-8d %-12s %-12s %-12s",
+		// Get SNI and DNS query for this session
+		var sni, dnsQuery string
+		for _, s := range sessions {
+			if s.SourceIP == session.SourceIP && s.DestinationIP == session.DestinationIP && s.DestinationPort == session.DestinationPort {
+				if s.SNI != "" {
+					sni = s.SNI
+				}
+				if s.DNSQuery != "" {
+					dnsQuery = s.DNSQuery
+				}
+				if sni != "" && dnsQuery != "" {
+					break
+				}
+			}
+		}
+
+		row := fmt.Sprintf("%-20s %-10s %-20s %-10d %-8s %-8d %-12s %-12s %-12s %-30s %-30s",
 			session.SourceIP,
 			srcPort,
 			session.DestinationIP,
@@ -721,9 +774,34 @@ func formatSnapshot(snapshot NetworkSnapshot) string {
 			session.Count,
 			avgBytesStr,
 			totalBytesStr,
-			durationStr)
+			durationStr,
+			sni,
+			dnsQuery)
 
 		builder.WriteString(row + "\n")
+	}
+
+	// Add a summary of unique SNIs and DNS queries
+	builder.WriteString("\n=== SNI Summary ===\n")
+	sniMap := make(map[string]bool)
+	for _, session := range sessions {
+		if session.SNI != "" {
+			sniMap[session.SNI] = true
+		}
+	}
+	for sni := range sniMap {
+		builder.WriteString(fmt.Sprintf("%s\n", sni))
+	}
+
+	builder.WriteString("\n=== DNS Query Summary ===\n")
+	dnsMap := make(map[string]bool)
+	for _, session := range sessions {
+		if session.DNSQuery != "" {
+			dnsMap[session.DNSQuery] = true
+		}
+	}
+	for dns := range dnsMap {
+		builder.WriteString(fmt.Sprintf("%s\n", dns))
 	}
 
 	return builder.String()
@@ -750,4 +828,95 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 	}
 	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+func parseTLSHandshake(data []byte) (string, error) {
+	if len(data) < 5 { // Minimum length for handshake header
+		return "", fmt.Errorf("handshake too short")
+	}
+
+	// First byte is handshake type
+	handshakeType := data[0]
+	if handshakeType != TLSClientHello {
+		return "", fmt.Errorf("not a client hello")
+	}
+
+	// Next 3 bytes are length
+	length := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+	if len(data) < length+4 {
+		return "", fmt.Errorf("handshake length mismatch")
+	}
+
+	// Skip version (2 bytes) and random (32 bytes)
+	pos := 38
+	if pos >= len(data) {
+		return "", fmt.Errorf("handshake too short for session id")
+	}
+
+	// Skip session id
+	sessionIDLength := int(data[pos])
+	pos += 1 + sessionIDLength
+	if pos >= len(data) {
+		return "", fmt.Errorf("handshake too short for cipher suites")
+	}
+
+	// Skip cipher suites
+	cipherSuitesLength := int(data[pos])<<8 | int(data[pos+1])
+	pos += 2 + cipherSuitesLength
+	if pos >= len(data) {
+		return "", fmt.Errorf("handshake too short for compression methods")
+	}
+
+	// Skip compression methods
+	compressionMethodsLength := int(data[pos])
+	pos += 1 + compressionMethodsLength
+	if pos >= len(data) {
+		return "", fmt.Errorf("handshake too short for extensions")
+	}
+
+	// Parse extensions
+	if pos+2 > len(data) {
+		return "", fmt.Errorf("no extensions present")
+	}
+	extensionsLength := int(data[pos])<<8 | int(data[pos+1])
+	pos += 2
+	extensionsEnd := pos + extensionsLength
+
+	// Iterate through extensions
+	for pos+4 <= extensionsEnd {
+		extensionType := int(data[pos])<<8 | int(data[pos+1])
+		extensionLength := int(data[pos+2])<<8 | int(data[pos+3])
+		pos += 4
+
+		if extensionType == TLSExtServerName {
+			if pos+2 > len(data) {
+				return "", fmt.Errorf("SNI extension too short")
+			}
+			sniListLength := int(data[pos])<<8 | int(data[pos+1])
+			pos += 2
+
+			if pos+sniListLength > len(data) {
+				return "", fmt.Errorf("SNI list too short")
+			}
+
+			// Read SNI entries
+			sniEnd := pos + sniListLength
+			for pos+3 <= sniEnd {
+				sniType := data[pos]
+				sniLength := int(data[pos+1])<<8 | int(data[pos+2])
+				pos += 3
+
+				if sniType == 0 { // Host name
+					if pos+sniLength > len(data) {
+						return "", fmt.Errorf("SNI hostname too short")
+					}
+					return string(data[pos : pos+sniLength]), nil
+				}
+				pos += sniLength
+			}
+		}
+		pos += extensionLength
+	}
+
+	return "", fmt.Errorf("no SNI extension found")
 }
