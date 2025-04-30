@@ -88,16 +88,31 @@ type OpenAIResponse struct {
 	} `json:"choices"`
 }
 
+type IgnorePattern struct {
+	Type  string
+	Value string
+}
+
+type IgnoreStats struct {
+	IPPairs    int
+	DNSQueries int
+	SNIHosts   int
+	Ports      int
+	IPs        int
+}
+
 var (
-	interfaceName = flag.String("i", "", "Network interface to monitor")
-	apiKey        = flag.String("k", "", "OpenAI API key")
-	debugMode     = flag.Bool("debug", false, "Enable debug mode for verbose output")
-	debugAIMode   = flag.Bool("debug-ai", false, "Enable AI conversation debugging")
-	sessions      = make(map[string]Session)
-	sessionMutex  = &sync.RWMutex{}
-	logger        = logrus.New()
-	aiSessionID   string
-	chatHistory   []map[string]string
+	interfaceName  = flag.String("i", "", "Network interface to monitor")
+	apiKey         = flag.String("k", "", "OpenAI API key")
+	debugMode      = flag.Bool("debug", false, "Enable debug mode for verbose output")
+	debugAIMode    = flag.Bool("debug-ai", false, "Enable AI conversation debugging")
+	sessions       = make(map[string]Session)
+	sessionMutex   = &sync.RWMutex{}
+	logger         = logrus.New()
+	aiSessionID    string
+	chatHistory    []map[string]string
+	ignorePatterns []IgnorePattern
+	ignoreStats    IgnoreStats
 )
 
 // TLS record types
@@ -252,6 +267,19 @@ func processPacket(packet gopacket.Packet) {
 		dstIP,
 		dstPort)
 
+	// Check if this session should be ignored
+	if shouldIgnore(Session{
+		SourceIP:      srcIP,
+		DestinationIP: dstIP,
+		DNSQuery:      "", // Will be set later if found
+		SNI:           "", // Will be set later if found
+	}) {
+		if *debugMode {
+			logger.Debugf("Ignoring session %s based on ignore patterns", sessionKey)
+		}
+		return
+	}
+
 	// Update or create session
 	sessionMutex.Lock()
 	session, exists := sessions[sessionKey]
@@ -279,6 +307,35 @@ func processPacket(packet gopacket.Packet) {
 		session.BytesReceived += int64(packetLength)
 	}
 
+	// Check for DNS
+	if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
+		if *debugMode {
+			logger.Debug("DNS packet detected")
+		}
+		dns, ok := dnsLayer.(*layers.DNS)
+		if ok && dns.QR == false { // Only process DNS queries
+			for _, question := range dns.Questions {
+				query := string(question.Name)
+				// Check if this DNS query should be ignored
+				if shouldIgnore(Session{
+					SourceIP:      srcIP,
+					DestinationIP: dstIP,
+					DNSQuery:      query,
+					SNI:           "", // Will be set later if found
+				}) {
+					if *debugMode {
+						logger.Debugf("Ignoring DNS query %s based on ignore patterns", query)
+					}
+					continue
+				}
+				session.DNSQuery = query
+				if *debugMode {
+					logger.Debugf("Extracted DNS query: %s", query)
+				}
+			}
+		}
+	}
+
 	// Check for TLS
 	if tlsLayer := packet.Layer(layers.LayerTypeTLS); tlsLayer != nil {
 		if *debugMode {
@@ -291,29 +348,24 @@ func processPacket(packet gopacket.Packet) {
 		if len(payload) > 0 {
 			// Try to parse the TLS handshake
 			if sni, err := parseTLSHandshake(payload); err == nil && sni != "" {
-				session.SNI = sni
-				if *debugMode {
-					logger.Debugf("Extracted SNI: %s", session.SNI)
+				// Check if this SNI should be ignored
+				if shouldIgnore(Session{
+					SourceIP:      srcIP,
+					DestinationIP: dstIP,
+					DNSQuery:      "", // Already checked
+					SNI:           sni,
+				}) {
+					if *debugMode {
+						logger.Debugf("Ignoring SNI %s based on ignore patterns", sni)
+					}
+				} else {
+					session.SNI = sni
+					if *debugMode {
+						logger.Debugf("Extracted SNI: %s", session.SNI)
+					}
 				}
 			} else if *debugMode && err != nil {
 				logger.Debugf("Failed to parse TLS handshake: %v", err)
-			}
-		}
-	}
-
-	// Check for DNS
-	if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
-		if *debugMode {
-			logger.Debug("DNS packet detected")
-		}
-		dns, ok := dnsLayer.(*layers.DNS)
-		if ok && dns.QR == false { // Only process DNS queries
-			for _, question := range dns.Questions {
-				query := string(question.Name)
-				session.DNSQuery = query
-				if *debugMode {
-					logger.Debugf("Extracted DNS query: %s", query)
-				}
 			}
 		}
 	}
@@ -393,6 +445,12 @@ func printSessionStats(snapshot NetworkSnapshot) {
 	logger.Infof("Total Sessions: %d", len(snapshot.Sessions))
 	logger.Infof("SNI Count: %d", sniCount)
 	logger.Infof("DNS Query Count: %d", dnsCount)
+	logger.Infof("Ignored Traffic:")
+	logger.Infof("  • IP Pairs: %d", ignoreStats.IPPairs)
+	logger.Infof("  • DNS Queries: %d", ignoreStats.DNSQueries)
+	logger.Infof("  • SNI Hosts: %d", ignoreStats.SNIHosts)
+	logger.Infof("  • Ports: %d", ignoreStats.Ports)
+	logger.Infof("  • IPs: %d", ignoreStats.IPs)
 	logger.Info("========================\n")
 }
 
@@ -461,7 +519,12 @@ func sendSnapshot(snapshot NetworkSnapshot) string {
 	// Initialize chat history if empty
 	if len(chatHistory) == 0 {
 		systemPrompt := `You are a network security expert analyzing network traffic. Categorize traffic into:
-1. "IGNORE": typical patterns with source/destination pairs
+1. "IGNORE": patterns to be ignored, specified as:
+   - pair:IP:IP - ignore specific IP pairs (e.g., "pair:192.168.1.1:192.168.1.2")
+   - port:PORT - ignore traffic to/from specific ports (e.g., "port:80")
+   - ip:IP - ignore traffic involving specific IPs (e.g., "ip:192.168.1.1")
+   - dns:QUERY - ignore specific DNS queries (e.g., "dns:google.com")
+   - sni:HOST - ignore specific SNI hosts (e.g., "sni:google.com")
 2. anomalies: unusual patterns with session counts and bytes, this something you will track with context because it might not be serious now but worth nothing and watching.
 3. "BAD": malicious activity with session counts and bytes
 
@@ -471,7 +534,13 @@ Note: exfil is only outbound connections that are long lived (multiple API sessi
 
 Respond in this exact JSON format:
 {
-    "IGNORE": [{"description": "pattern", "details": [{"source": "ip", "destination": "ip"}]}],
+    "IGNORE": [
+        {"type": "pair", "value": "192.168.1.1:192.168.1.2"},
+        {"type": "port", "value": "80"},
+        {"type": "ip", "value": "192.168.1.1"},
+        {"type": "dns", "value": "google.com"},
+        {"type": "sni", "value": "google.com"}
+    ],
     "BAD": [{"description": "threat", "details": {"source": "ip", "destination": "ip", "session_count": N, "total_bytes": "size"}}],
     "SUMMARY": "A short summary of the analysis"
 }`
@@ -611,10 +680,34 @@ func pruneSessions(aiResponse string) {
 	}
 
 	// Parse the AI response
-	var analysis AIAnalysis
+	var analysis struct {
+		Ignore []struct {
+			Type  string `json:"type"`
+			Value string `json:"value"`
+		} `json:"IGNORE"`
+		Bad []struct {
+			Description string `json:"description"`
+			Details     struct {
+				Source       string `json:"source"`
+				Destination  string `json:"destination"`
+				SessionCount int    `json:"session_count"`
+				TotalBytes   string `json:"total_bytes"`
+			} `json:"details"`
+		} `json:"BAD"`
+		Summary string `json:"SUMMARY"`
+	}
 	if err := json.Unmarshal([]byte(cleanResponse), &analysis); err != nil {
 		logger.Errorf("Error parsing AI response: %v", err)
 		return
+	}
+
+	// Update ignore patterns
+	for _, ignore := range analysis.Ignore {
+		pattern := IgnorePattern{
+			Type:  ignore.Type,
+			Value: ignore.Value,
+		}
+		ignorePatterns = append(ignorePatterns, pattern)
 	}
 
 	// Create a map of sessions to keep
@@ -626,36 +719,28 @@ func pruneSessions(aiResponse string) {
 		sessionsToKeep[key] = true
 	}
 
-	// Prune uninteresting sessions and clear DNS/SNI
+	// Clear all DNS and SNI data after sending to AI
 	for key, session := range sessions {
+		session.DNSQuery = ""
+		session.SNI = ""
+		sessions[key] = session
+	}
+
+	// Prune uninteresting sessions
+	for key := range sessions {
 		if !sessionsToKeep[key] {
 			// Check if this session is marked as normal
 			isNormal := false
 			for _, ignore := range analysis.Ignore {
-				for _, detail := range ignore.Details {
-					normalKey := fmt.Sprintf("%s:%s", detail.Source, detail.Destination)
-					if normalKey == key {
-						isNormal = true
-						break
-					}
-				}
-				if isNormal {
+				normalKey := fmt.Sprintf("%s:%s", ignore.Value, ignore.Value)
+				if normalKey == key {
+					isNormal = true
 					break
 				}
 			}
 			if isNormal {
 				delete(sessions, key)
-			} else {
-				// Clear DNS and SNI for sessions we're keeping
-				session.DNSQuery = ""
-				session.SNI = ""
-				sessions[key] = session
 			}
-		} else {
-			// Clear DNS and SNI for sessions we're keeping
-			session.DNSQuery = ""
-			session.SNI = ""
-			sessions[key] = session
 		}
 	}
 
@@ -671,6 +756,13 @@ func pruneSessions(aiResponse string) {
 	logger.Infof("Original session count: %d", originalCount)
 	logger.Infof("Current session count: %d", len(sessions))
 	logger.Infof("Sessions pruned: %d", originalCount-len(sessions))
+	logger.Infof("Ignore patterns: %d", len(ignorePatterns))
+	logger.Infof("Ignored Traffic:")
+	logger.Infof("  • IP Pairs: %d", ignoreStats.IPPairs)
+	logger.Infof("  • DNS Queries: %d", ignoreStats.DNSQueries)
+	logger.Infof("  • SNI Hosts: %d", ignoreStats.SNIHosts)
+	logger.Infof("  • Ports: %d", ignoreStats.Ports)
+	logger.Infof("  • IPs: %d", ignoreStats.IPs)
 
 	// Log AI's categorization
 	logger.Info("\nAI Analysis Summary:")
@@ -678,20 +770,15 @@ func pruneSessions(aiResponse string) {
 	logger.Infof("Ignored traffic groups: %d", len(analysis.Ignore))
 	logger.Infof("Bad sessions: %d", len(analysis.Bad))
 
-	// Log some example reasons
+	// Log ignore patterns
 	if len(analysis.Ignore) > 0 {
-		logger.Info("\nExample ignored traffic:")
-		for i := 0; i < min(3, len(analysis.Ignore)); i++ {
-			logger.Infof("- %s", analysis.Ignore[i].Description)
-			for j := 0; j < min(3, len(analysis.Ignore[i].Details)); j++ {
-				logger.Infof("  • %s -> %s",
-					analysis.Ignore[i].Details[j].Source,
-					analysis.Ignore[i].Details[j].Destination)
-			}
+		logger.Info("\nIgnore Patterns:")
+		for _, ignore := range analysis.Ignore {
+			logger.Infof("- %s: %s", ignore.Type, ignore.Value)
 		}
 	}
 	if len(analysis.Bad) > 0 {
-		logger.Info("\nExample bad sessions:")
+		logger.Info("\nBad sessions:")
 		for i := 0; i < min(3, len(analysis.Bad)); i++ {
 			logger.Infof("- %s -> %s (%d sessions, %s): %s",
 				analysis.Bad[i].Details.Source,
@@ -732,6 +819,12 @@ func formatSnapshot(snapshot NetworkSnapshot) string {
 		return compressedSessions[i].TotalBytes > compressedSessions[j].TotalBytes
 	})
 
+	// Limit the number of sessions to keep token count reasonable
+	maxSessions := 50
+	if len(compressedSessions) > maxSessions {
+		compressedSessions = compressedSessions[:maxSessions]
+	}
+
 	// Format each session as a table row
 	for _, session := range compressedSessions {
 		srcPort := fmt.Sprintf("%d", session.SourcePort)
@@ -765,6 +858,14 @@ func formatSnapshot(snapshot NetworkSnapshot) string {
 			}
 		}
 
+		// Truncate long SNI and DNS queries
+		if len(sni) > 30 {
+			sni = sni[:27] + "..."
+		}
+		if len(dnsQuery) > 30 {
+			dnsQuery = dnsQuery[:27] + "..."
+		}
+
 		row := fmt.Sprintf("%-20s %-10s %-20s %-10d %-8s %-8d %-12s %-12s %-12s %-30s %-30s",
 			session.SourceIP,
 			srcPort,
@@ -781,7 +882,7 @@ func formatSnapshot(snapshot NetworkSnapshot) string {
 		builder.WriteString(row + "\n")
 	}
 
-	// Add a summary of unique SNIs and DNS queries
+	// Add a summary of unique SNIs and DNS queries, but limit the number
 	builder.WriteString("\n=== SNI Summary ===\n")
 	sniMap := make(map[string]bool)
 	for _, session := range sessions {
@@ -789,8 +890,14 @@ func formatSnapshot(snapshot NetworkSnapshot) string {
 			sniMap[session.SNI] = true
 		}
 	}
+	// Limit to top 20 unique SNIs
+	sniCount := 0
 	for sni := range sniMap {
+		if sniCount >= 20 {
+			break
+		}
 		builder.WriteString(fmt.Sprintf("%s\n", sni))
+		sniCount++
 	}
 
 	builder.WriteString("\n=== DNS Query Summary ===\n")
@@ -800,8 +907,14 @@ func formatSnapshot(snapshot NetworkSnapshot) string {
 			dnsMap[session.DNSQuery] = true
 		}
 	}
+	// Limit to top 20 unique DNS queries
+	dnsCount := 0
 	for dns := range dnsMap {
+		if dnsCount >= 20 {
+			break
+		}
 		builder.WriteString(fmt.Sprintf("%s\n", dns))
+		dnsCount++
 	}
 
 	return builder.String()
@@ -919,4 +1032,44 @@ func parseTLSHandshake(data []byte) (string, error) {
 	}
 
 	return "", fmt.Errorf("no SNI extension found")
+}
+
+func shouldIgnore(session Session) bool {
+	for _, pattern := range ignorePatterns {
+		switch pattern.Type {
+		case "pair":
+			// Check if either direction of the IP pair matches
+			if (session.SourceIP+":"+session.DestinationIP == pattern.Value) ||
+				(session.DestinationIP+":"+session.SourceIP == pattern.Value) {
+				ignoreStats.IPPairs++
+				return true
+			}
+		case "port":
+			// Check if either source or destination port matches
+			port := pattern.Value
+			if strconv.Itoa(session.SourcePort) == port || strconv.Itoa(session.DestinationPort) == port {
+				ignoreStats.Ports++
+				return true
+			}
+		case "ip":
+			// Check if either source or destination IP matches
+			if session.SourceIP == pattern.Value || session.DestinationIP == pattern.Value {
+				ignoreStats.IPs++
+				return true
+			}
+		case "dns":
+			// Check if DNS query matches
+			if session.DNSQuery != "" && strings.Contains(session.DNSQuery, pattern.Value) {
+				ignoreStats.DNSQueries++
+				return true
+			}
+		case "sni":
+			// Check if SNI host matches
+			if session.SNI != "" && strings.Contains(session.SNI, pattern.Value) {
+				ignoreStats.SNIHosts++
+				return true
+			}
+		}
+	}
+	return false
 }
