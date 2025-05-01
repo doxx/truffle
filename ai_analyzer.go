@@ -20,6 +20,11 @@ type AISession struct {
 	lastPrompt    time.Time
 	promptCounter int
 	filterManager *FilterManager
+	debug         bool
+	// Token tracking
+	tokenUsage     int
+	lastTokenReset time.Time
+	rateLimiter    *RateLimiter
 }
 
 // AIResponse represents the AI's analysis of our network data
@@ -37,12 +42,68 @@ type AIResponse struct {
 	Summary string `json:"summary"`
 }
 
+// RateLimiter tracks token usage and enforces rate limits
+type RateLimiter struct {
+	mu            sync.Mutex
+	tokenLimit    int
+	tokenUsage    int
+	lastReset     time.Time
+	resetInterval time.Duration
+}
+
+// NewRateLimiter creates a new rate limiter
+func NewRateLimiter(tokenLimit int, resetInterval time.Duration) *RateLimiter {
+	return &RateLimiter{
+		tokenLimit:    tokenLimit,
+		resetInterval: resetInterval,
+		lastReset:     time.Now(),
+	}
+}
+
+// CanProceed checks if we can make another request based on token limits
+func (rl *RateLimiter) CanProceed(estimatedTokens int) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	// Reset token count if interval has passed
+	if time.Since(rl.lastReset) >= rl.resetInterval {
+		rl.tokenUsage = 0
+		rl.lastReset = time.Now()
+	}
+
+	// Check if we have enough tokens remaining
+	return rl.tokenUsage+estimatedTokens <= rl.tokenLimit
+}
+
+// UpdateUsage updates the token usage
+func (rl *RateLimiter) UpdateUsage(tokens int) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.tokenUsage += tokens
+}
+
+// GetWaitTime returns how long to wait before next request
+func (rl *RateLimiter) GetWaitTime(estimatedTokens int) time.Duration {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	// If we can proceed immediately, return 0
+	if rl.tokenUsage+estimatedTokens <= rl.tokenLimit {
+		return 0
+	}
+
+	// Calculate time until next reset
+	nextReset := rl.lastReset.Add(rl.resetInterval)
+	return time.Until(nextReset)
+}
+
 // NewAISession creates a new AI analysis session
-func NewAISession(apiKey string) *AISession {
+func NewAISession(apiKey string, debug bool) *AISession {
 	return &AISession{
 		apiKey:        apiKey,
 		chatHistory:   make([]map[string]string, 0),
-		filterManager: NewFilterManager(),
+		filterManager: NewFilterManager(debug),
+		debug:         debug,
 	}
 }
 
@@ -187,6 +248,8 @@ Your job is to:
 4. Provide evidence for your decisions
 5. Maintain context across analysis cycles
 
+Note: With the summary provide to and from IP addresses and ports that might be related to the issue. For example if it's a bad dns host, what host did that query.
+
 Data Filter Format:
 Use a simple filter language that can match:
 - IP addresses (e.g., "ip:192.168.1.1")
@@ -281,8 +344,10 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 	}
 
 	// Log the raw response for debugging
-	log.Printf("OpenAI Response Status: %d", resp.StatusCode)
-	log.Printf("OpenAI Response Body: %s", string(body))
+	if s.debug {
+		log.Printf("OpenAI Response Status: %d", resp.StatusCode)
+		log.Printf("OpenAI Response Body: %s", string(body))
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
@@ -354,21 +419,31 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 
 // processResponse handles the AI's response and applies filters
 func (s *AISession) processResponse(response *AIResponse) {
-	log.Println("\n=== AI Analysis ===")
-	log.Println("Filters:")
+	// Always show the AI analysis summary
+	log.Printf("\n=== AI Analysis ===")
+	if len(response.Anomalies) > 0 {
+		log.Printf("\nAnomalies:")
+		for _, anomaly := range response.Anomalies {
+			log.Printf("- %s (Severity: %s)\n  Evidence: %s",
+				anomaly.Description, anomaly.Severity, anomaly.Evidence)
+		}
+	} else {
+		log.Printf("\nNo anomalies detected")
+	}
+	log.Printf("\nSummary: %s", response.Summary)
+	log.Printf("==================\n")
+
+	// Only show filter details in debug mode
+	if s.debug {
+		log.Printf("Filters:")
+		for _, filter := range response.Filters {
+			log.Printf("- %s (TTL: %d minutes)\n  Reason: %s",
+				filter.Rule, filter.TTL, filter.Reason)
+		}
+	}
+
+	// Add filters to filter manager regardless of debug mode
 	for _, filter := range response.Filters {
-		log.Printf("- %s (TTL: %d minutes)\n  Reason: %s",
-			filter.Rule, filter.TTL, filter.Reason)
-		// Add the filter to our filter manager
 		s.filterManager.AddFilter(filter.Rule, filter.Reason, filter.TTL)
 	}
-
-	log.Println("\nAnomalies:")
-	for _, anomaly := range response.Anomalies {
-		log.Printf("- %s (Severity: %s)\n  Evidence: %s",
-			anomaly.Description, anomaly.Severity, anomaly.Evidence)
-	}
-
-	log.Printf("\nSummary: %s\n", response.Summary)
-	log.Println("==================\n")
 }

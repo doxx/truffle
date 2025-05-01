@@ -19,12 +19,14 @@ type State struct {
 	SNIRecords  map[string]*SNIRecord
 	mu          sync.RWMutex
 	rollupChan  chan NetworkRollup
+	debug       bool
 }
 
 func main() {
 	// Parse command line flags
 	interfaceName := flag.String("i", "", "Network interface to capture on")
 	apiKey := flag.String("k", "", "OpenAI API key")
+	debug := flag.Bool("debug", false, "Enable debug output")
 	flag.Parse()
 
 	if *interfaceName == "" {
@@ -41,10 +43,11 @@ func main() {
 		DNSRecords:  make(map[string]*DNSRecord),
 		SNIRecords:  make(map[string]*SNIRecord),
 		rollupChan:  make(chan NetworkRollup, 10), // Buffered channel to prevent blocking
+		debug:       *debug,
 	}
 
 	// Initialize AI session
-	aiSession := NewAISession(*apiKey)
+	aiSession := NewAISession(*apiKey, *debug)
 	aiSession.StartAnalysis(state.rollupChan)
 
 	// Start packet capture
@@ -378,9 +381,11 @@ func (s *State) cleanup() {
 	// Cleanup connections
 	for key, conn := range s.Connections {
 		if conn.LastSeen.Before(threshold) {
-			log.Printf("Aging out connection: %s:%d <-> %s:%d (last seen: %s)",
-				conn.Endpoint1, conn.Port1, conn.Endpoint2, conn.Port2,
-				conn.LastSeen.Format(time.RFC3339))
+			if s.debug {
+				log.Printf("Aging out connection: %s:%d <-> %s:%d (last seen: %s)",
+					conn.Endpoint1, conn.Port1, conn.Endpoint2, conn.Port2,
+					conn.LastSeen.Format(time.RFC3339))
+			}
 			delete(s.Connections, key)
 		}
 	}
@@ -388,8 +393,10 @@ func (s *State) cleanup() {
 	// Cleanup DNS records
 	for key, record := range s.DNSRecords {
 		if record.LastSeen.Before(threshold) {
-			log.Printf("Aging out DNS record: %s (last seen: %s)",
-				record.Query, record.LastSeen.Format(time.RFC3339))
+			if s.debug {
+				log.Printf("Aging out DNS record: %s (last seen: %s)",
+					record.Query, record.LastSeen.Format(time.RFC3339))
+			}
 			delete(s.DNSRecords, key)
 		}
 	}
@@ -397,31 +404,39 @@ func (s *State) cleanup() {
 	// Cleanup SNI records
 	for key, record := range s.SNIRecords {
 		if record.LastSeen.Before(threshold) {
-			log.Printf("Aging out SNI record: %s (last seen: %s)",
-				record.Hostname, record.LastSeen.Format(time.RFC3339))
+			if s.debug {
+				log.Printf("Aging out SNI record: %s (last seen: %s)",
+					record.Hostname, record.LastSeen.Format(time.RFC3339))
+			}
 			delete(s.SNIRecords, key)
 		}
 	}
 
 	// Log cleanup results
-	if originalConnections != len(s.Connections) {
-		log.Printf("Aged out %d connections: %d -> %d",
-			originalConnections-len(s.Connections),
-			originalConnections, len(s.Connections))
-	}
-	if originalDNS != len(s.DNSRecords) {
-		log.Printf("Aged out %d DNS records: %d -> %d",
-			originalDNS-len(s.DNSRecords),
-			originalDNS, len(s.DNSRecords))
-	}
-	if originalSNI != len(s.SNIRecords) {
-		log.Printf("Aged out %d SNI records: %d -> %d",
-			originalSNI-len(s.SNIRecords),
-			originalSNI, len(s.SNIRecords))
+	if s.debug {
+		if originalConnections != len(s.Connections) {
+			log.Printf("Aged out %d connections: %d -> %d",
+				originalConnections-len(s.Connections),
+				originalConnections, len(s.Connections))
+		}
+		if originalDNS != len(s.DNSRecords) {
+			log.Printf("Aged out %d DNS records: %d -> %d",
+				originalDNS-len(s.DNSRecords),
+				originalDNS, len(s.DNSRecords))
+		}
+		if originalSNI != len(s.SNIRecords) {
+			log.Printf("Aged out %d SNI records: %d -> %d",
+				originalSNI-len(s.SNIRecords),
+				originalSNI, len(s.SNIRecords))
+		}
 	}
 }
 
 func (s *State) display() {
+	if !s.debug {
+		return
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

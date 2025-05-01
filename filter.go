@@ -20,12 +20,14 @@ type Filter struct {
 type FilterManager struct {
 	filters map[string]*Filter
 	mu      sync.RWMutex
+	debug   bool
 }
 
 // NewFilterManager creates a new filter manager
-func NewFilterManager() *FilterManager {
+func NewFilterManager(debug bool) *FilterManager {
 	return &FilterManager{
 		filters: make(map[string]*Filter),
+		debug:   debug,
 	}
 }
 
@@ -53,12 +55,14 @@ func (fm *FilterManager) RemoveExpiredFilters() {
 	removedCount := 0
 	for rule, filter := range fm.filters {
 		if now.After(filter.Expiry) {
-			log.Printf("Removing expired filter: %s (Reason: %s)", rule, filter.Reason)
+			if fm.debug {
+				log.Printf("Removing expired filter: %s (Reason: %s)", rule, filter.Reason)
+			}
 			delete(fm.filters, rule)
 			removedCount++
 		}
 	}
-	if removedCount > 0 {
+	if removedCount > 0 && fm.debug {
 		log.Printf("Removed %d expired filters", removedCount)
 	}
 }
@@ -70,7 +74,9 @@ func (fm *FilterManager) ShouldFilter(item interface{}) bool {
 
 	for _, filter := range fm.filters {
 		if matchesFilter(item, filter.Rule) {
-			log.Printf("Filter match: %s matches rule %s (Reason: %s)", item, filter.Rule, filter.Reason)
+			if fm.debug {
+				log.Printf("Filter match: %s matches rule %s (Reason: %s)", item, filter.Rule, filter.Reason)
+			}
 			return true
 		}
 	}
@@ -164,12 +170,14 @@ func (fm *FilterManager) ApplyFilters(rollup *NetworkRollup) {
 	fm.RemoveExpiredFilters()
 
 	// Log active filters
-	fm.mu.RLock()
-	log.Printf("Active filters: %d", len(fm.filters))
-	for _, filter := range fm.filters {
-		log.Printf("Filter: %s (TTL: %d minutes remaining)", filter.Rule, int(time.Until(filter.Expiry).Minutes()))
+	if fm.debug {
+		fm.mu.RLock()
+		log.Printf("Active filters: %d", len(fm.filters))
+		for _, filter := range fm.filters {
+			log.Printf("Filter: %s (TTL: %d minutes remaining)", filter.Rule, int(time.Until(filter.Expiry).Minutes()))
+		}
+		fm.mu.RUnlock()
 	}
-	fm.mu.RUnlock()
 
 	originalCount := len(rollup.Connections)
 	// Filter connections
@@ -181,7 +189,9 @@ func (fm *FilterManager) ApplyFilters(rollup *NetworkRollup) {
 		}
 	}
 	rollup.Connections = filteredConnections
-	log.Printf("Filtered connections: %d -> %d", originalCount, len(rollup.Connections))
+	if fm.debug {
+		log.Printf("Filtered connections: %d -> %d", originalCount, len(rollup.Connections))
+	}
 
 	originalCount = len(rollup.DNSRecords)
 	// Filter DNS records
@@ -189,12 +199,14 @@ func (fm *FilterManager) ApplyFilters(rollup *NetworkRollup) {
 	for _, dns := range rollup.DNSRecords {
 		if !fm.ShouldFilter(dns.Query) {
 			filteredDNS = append(filteredDNS, dns)
-		} else {
+		} else if fm.debug {
 			log.Printf("Filtered DNS query: %s", dns.Query)
 		}
 	}
 	rollup.DNSRecords = filteredDNS
-	log.Printf("Filtered DNS records: %d -> %d", originalCount, len(rollup.DNSRecords))
+	if fm.debug {
+		log.Printf("Filtered DNS records: %d -> %d", originalCount, len(rollup.DNSRecords))
+	}
 
 	originalCount = len(rollup.SNIRecords)
 	// Filter SNI records
@@ -202,10 +214,12 @@ func (fm *FilterManager) ApplyFilters(rollup *NetworkRollup) {
 	for _, sni := range rollup.SNIRecords {
 		if !fm.ShouldFilter(sni.Hostname) {
 			filteredSNI = append(filteredSNI, sni)
-		} else {
+		} else if fm.debug {
 			log.Printf("Filtered SNI hostname: %s", sni.Hostname)
 		}
 	}
 	rollup.SNIRecords = filteredSNI
-	log.Printf("Filtered SNI records: %d -> %d", originalCount, len(rollup.SNIRecords))
+	if fm.debug {
+		log.Printf("Filtered SNI records: %d -> %d", originalCount, len(rollup.SNIRecords))
+	}
 }
