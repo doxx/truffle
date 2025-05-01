@@ -359,9 +359,17 @@ func (s *State) cleanup() {
 	now := time.Now()
 	threshold := now.Add(-30 * time.Second)
 
+	// Track counts before cleanup
+	originalConnections := len(s.Connections)
+	originalDNS := len(s.DNSRecords)
+	originalSNI := len(s.SNIRecords)
+
 	// Cleanup connections
 	for key, conn := range s.Connections {
 		if conn.LastSeen.Before(threshold) {
+			log.Printf("Aging out connection: %s:%d <-> %s:%d (last seen: %s)",
+				conn.Endpoint1, conn.Port1, conn.Endpoint2, conn.Port2,
+				conn.LastSeen.Format(time.RFC3339))
 			delete(s.Connections, key)
 		}
 	}
@@ -369,6 +377,8 @@ func (s *State) cleanup() {
 	// Cleanup DNS records
 	for key, record := range s.DNSRecords {
 		if record.LastSeen.Before(threshold) {
+			log.Printf("Aging out DNS record: %s (last seen: %s)",
+				record.Query, record.LastSeen.Format(time.RFC3339))
 			delete(s.DNSRecords, key)
 		}
 	}
@@ -376,8 +386,27 @@ func (s *State) cleanup() {
 	// Cleanup SNI records
 	for key, record := range s.SNIRecords {
 		if record.LastSeen.Before(threshold) {
+			log.Printf("Aging out SNI record: %s (last seen: %s)",
+				record.Hostname, record.LastSeen.Format(time.RFC3339))
 			delete(s.SNIRecords, key)
 		}
+	}
+
+	// Log cleanup results
+	if originalConnections != len(s.Connections) {
+		log.Printf("Aged out %d connections: %d -> %d",
+			originalConnections-len(s.Connections),
+			originalConnections, len(s.Connections))
+	}
+	if originalDNS != len(s.DNSRecords) {
+		log.Printf("Aged out %d DNS records: %d -> %d",
+			originalDNS-len(s.DNSRecords),
+			originalDNS, len(s.DNSRecords))
+	}
+	if originalSNI != len(s.SNIRecords) {
+		log.Printf("Aged out %d SNI records: %d -> %d",
+			originalSNI-len(s.SNIRecords),
+			originalSNI, len(s.SNIRecords))
 	}
 }
 

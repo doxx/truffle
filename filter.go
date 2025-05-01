@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -51,10 +50,16 @@ func (fm *FilterManager) RemoveExpiredFilters() {
 	defer fm.mu.Unlock()
 
 	now := time.Now()
+	removedCount := 0
 	for rule, filter := range fm.filters {
 		if now.After(filter.Expiry) {
+			log.Printf("Removing expired filter: %s (Reason: %s)", rule, filter.Reason)
 			delete(fm.filters, rule)
+			removedCount++
 		}
+	}
+	if removedCount > 0 {
+		log.Printf("Removed %d expired filters", removedCount)
 	}
 }
 
@@ -65,6 +70,7 @@ func (fm *FilterManager) ShouldFilter(item interface{}) bool {
 
 	for _, filter := range fm.filters {
 		if matchesFilter(item, filter.Rule) {
+			log.Printf("Filter match: %s matches rule %s (Reason: %s)", item, filter.Rule, filter.Reason)
 			return true
 		}
 	}
@@ -123,29 +129,27 @@ func matchesSingleCondition(item interface{}, condition string) bool {
 		}
 	case "dns":
 		if domain, ok := item.(string); ok {
-			// Convert wildcard pattern to regex pattern
-			pattern := strings.ReplaceAll(conditionValue, "*", ".*")
-			// Ensure we match the entire domain
-			pattern = "^" + pattern + "$"
-			// Escape dots in the pattern
-			pattern = strings.ReplaceAll(pattern, ".", "\\.")
-			// Convert wildcards back
-			pattern = strings.ReplaceAll(pattern, "\\*", ".*")
-			matched, _ := regexp.MatchString(pattern, domain)
-			return matched
+			// Handle wildcard at the start
+			if strings.HasPrefix(conditionValue, "*.") {
+				// Remove the wildcard and dot
+				baseDomain := conditionValue[2:]
+				// Check if the domain ends with the base domain
+				return strings.HasSuffix(domain, baseDomain)
+			}
+			// Exact match for non-wildcard
+			return domain == conditionValue
 		}
 	case "sni":
 		if hostname, ok := item.(string); ok {
-			// Convert wildcard pattern to regex pattern
-			pattern := strings.ReplaceAll(conditionValue, "*", ".*")
-			// Ensure we match the entire hostname
-			pattern = "^" + pattern + "$"
-			// Escape dots in the pattern
-			pattern = strings.ReplaceAll(pattern, ".", "\\.")
-			// Convert wildcards back
-			pattern = strings.ReplaceAll(pattern, "\\*", ".*")
-			matched, _ := regexp.MatchString(pattern, hostname)
-			return matched
+			// Handle wildcard at the start
+			if strings.HasPrefix(conditionValue, "*.") {
+				// Remove the wildcard and dot
+				baseDomain := conditionValue[2:]
+				// Check if the hostname ends with the base domain
+				return strings.HasSuffix(hostname, baseDomain)
+			}
+			// Exact match for non-wildcard
+			return hostname == conditionValue
 		}
 	case "proto":
 		if protocol, ok := item.(string); ok {
