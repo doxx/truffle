@@ -104,6 +104,7 @@ func NewAISession(apiKey string, debug bool) *AISession {
 		chatHistory:   make([]map[string]string, 0),
 		filterManager: NewFilterManager(debug),
 		debug:         debug,
+		rateLimiter:   NewRateLimiter(30000, time.Minute), // 30k tokens per minute limit
 	}
 }
 
@@ -250,6 +251,8 @@ Your job is to:
 
 Note: With the summary provide to and from IP addresses and ports that might be related to the issue. For example if it's a bad dns host, what host did that query.
 
+Also don't call these network snapshots, just say "the network"
+
 Data Filter Format:
 Use a simple filter language that can match:
 - IP addresses (e.g., "ip:192.168.1.1")
@@ -311,6 +314,17 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 		"content": data,
 	})
 
+	// Estimate tokens (roughly 1 token per 4 characters)
+	estimatedTokens := len(data) / 4
+
+	// Check if we can proceed with the request
+	if !s.rateLimiter.CanProceed(estimatedTokens) {
+		waitTime := s.rateLimiter.GetWaitTime(estimatedTokens)
+		if waitTime > 0 {
+			time.Sleep(waitTime)
+		}
+	}
+
 	// Prepare the request
 	requestBody := map[string]interface{}{
 		"model":    "gpt-4o",
@@ -350,6 +364,17 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		// If we hit a rate limit, update our token usage
+		if resp.StatusCode == http.StatusTooManyRequests {
+			var rateLimitError struct {
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(body, &rateLimitError); err == nil {
+				s.rateLimiter.UpdateUsage(estimatedTokens)
+			}
+		}
 		return nil, fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -359,6 +384,9 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			TotalTokens int `json:"total_tokens"`
+		} `json:"usage"`
 		Error struct {
 			Message string `json:"message"`
 		} `json:"error"`
@@ -375,6 +403,9 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 	if len(openAIResp.Choices) == 0 {
 		return nil, fmt.Errorf("no choices in OpenAI response")
 	}
+
+	// Update token usage with actual count
+	s.rateLimiter.UpdateUsage(openAIResp.Usage.TotalTokens)
 
 	// Parse the AI's response into our structured format
 	var aiResponse AIResponse
