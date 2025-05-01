@@ -1,6 +1,6 @@
 # Truffle
 
-![Truffle Logo](items/truffle.png)
+![Truffle Logo](items/truffle_small.png)
 
 Truffle is a sophisticated network traffic analysis tool that combines packet capture capabilities with AI-powered analysis. It monitors network traffic in real-time, identifies patterns, and provides intelligent insights about network behavior and potential anomalies.
 
