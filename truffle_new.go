@@ -12,43 +12,6 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
-// Connection represents a network connection between two endpoints
-type Connection struct {
-	Endpoint1        string
-	Port1            uint16
-	Port1IsEphemeral bool
-	Endpoint2        string
-	Port2            uint16
-	Port2IsEphemeral bool
-	Count            int
-	Bytes            int64
-	FirstSeen        time.Time
-	LastSeen         time.Time
-}
-
-// DNSRecord represents a DNS query/response
-type DNSRecord struct {
-	Query     string
-	Response  string
-	FirstSeen time.Time
-	LastSeen  time.Time
-}
-
-// SNIRecord represents a TLS SNI record
-type SNIRecord struct {
-	Hostname  string
-	FirstSeen time.Time
-	LastSeen  time.Time
-}
-
-// NetworkRollup represents a rollup of network data
-type NetworkRollup struct {
-	Timestamp   time.Time
-	Connections []Connection
-	DNSRecords  []DNSRecord
-	SNIRecords  []SNIRecord
-}
-
 // State represents the current state of our network analysis
 type State struct {
 	Connections map[string]*Connection
@@ -107,7 +70,6 @@ func main() {
 	}
 }
 
-// isTLSHandshake checks if the payload contains a TLS handshake
 func isTLSHandshake(payload []byte) bool {
 	// Check if we have enough data for a TLS record header
 	if len(payload) < 5 {
@@ -132,7 +94,6 @@ func isTLSHandshake(payload []byte) bool {
 	return true
 }
 
-// extractSNI extracts the Server Name Indication from a TLS handshake
 func extractSNI(payload []byte) (string, bool) {
 	// Skip TLS record header (5 bytes)
 	handshakeStart := 5
@@ -219,14 +180,12 @@ func extractSNI(payload []byte) (string, bool) {
 	return "", false
 }
 
-// isEphemeralPort returns true if the port is likely ephemeral
 func isEphemeralPort(port uint16) bool {
 	// Ports 49152-65535 are typically ephemeral
 	// Some systems use 32768-60999
 	return port >= 49152 || (port >= 32768 && port <= 60999)
 }
 
-// getCanonicalConnectionKey returns a consistent key for a connection regardless of direction
 func getCanonicalConnectionKey(srcIP string, srcPort uint16, dstIP string, dstPort uint16) string {
 	srcIsEphemeral := isEphemeralPort(srcPort)
 	dstIsEphemeral := isEphemeralPort(dstPort)
@@ -249,7 +208,6 @@ func getCanonicalConnectionKey(srcIP string, srcPort uint16, dstIP string, dstPo
 	return conn2
 }
 
-// processPacket handles each captured packet
 func (s *State) processPacket(packet gopacket.Packet) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -380,7 +338,6 @@ func (s *State) processPacket(packet gopacket.Packet) {
 	}
 }
 
-// cleanupRoutine periodically cleans up old entries
 func (s *State) cleanupRoutine() {
 	ticker := time.NewTicker(30 * time.Second)
 	for range ticker.C {
@@ -388,7 +345,6 @@ func (s *State) cleanupRoutine() {
 	}
 }
 
-// displayRoutine periodically displays the current state
 func (s *State) displayRoutine() {
 	ticker := time.NewTicker(30 * time.Second)
 	for range ticker.C {
@@ -396,7 +352,6 @@ func (s *State) displayRoutine() {
 	}
 }
 
-// cleanup removes entries older than 30 seconds
 func (s *State) cleanup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -426,7 +381,6 @@ func (s *State) cleanup() {
 	}
 }
 
-// display shows the current state
 func (s *State) display() {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -458,7 +412,6 @@ func (s *State) display() {
 	}
 }
 
-// rollupRoutine periodically collects and sends data to the AI
 func (s *State) rollupRoutine() {
 	ticker := time.NewTicker(30 * time.Second)
 	for range ticker.C {
