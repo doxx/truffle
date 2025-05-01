@@ -49,6 +49,9 @@ type RateLimiter struct {
 	tokenUsage    int
 	lastReset     time.Time
 	resetInterval time.Duration
+	bufferPercent int
+	tokenHistory  []int
+	maxHistory    int
 }
 
 // NewRateLimiter creates a new rate limiter
@@ -57,6 +60,9 @@ func NewRateLimiter(tokenLimit int, resetInterval time.Duration) *RateLimiter {
 		tokenLimit:    tokenLimit,
 		resetInterval: resetInterval,
 		lastReset:     time.Now(),
+		bufferPercent: 20, // Keep 20% buffer
+		tokenHistory:  make([]int, 0),
+		maxHistory:    5, // Keep last 5 requests
 	}
 }
 
@@ -69,10 +75,30 @@ func (rl *RateLimiter) CanProceed(estimatedTokens int) bool {
 	if time.Since(rl.lastReset) >= rl.resetInterval {
 		rl.tokenUsage = 0
 		rl.lastReset = time.Now()
+		rl.tokenHistory = rl.tokenHistory[:0]
 	}
 
-	// Check if we have enough tokens remaining
-	return rl.tokenUsage+estimatedTokens <= rl.tokenLimit
+	// Calculate average token usage from history
+	avgTokens := 0
+	if len(rl.tokenHistory) > 0 {
+		total := 0
+		for _, tokens := range rl.tokenHistory {
+			total += tokens
+		}
+		avgTokens = total / len(rl.tokenHistory)
+	}
+
+	// Use the larger of estimated tokens or average historical usage
+	expectedTokens := estimatedTokens
+	if avgTokens > estimatedTokens {
+		expectedTokens = avgTokens
+	}
+
+	// Add buffer to be more conservative
+	buffer := (rl.tokenLimit * rl.bufferPercent) / 100
+	effectiveLimit := rl.tokenLimit - buffer
+
+	return rl.tokenUsage+expectedTokens <= effectiveLimit
 }
 
 // UpdateUsage updates the token usage
@@ -80,6 +106,12 @@ func (rl *RateLimiter) UpdateUsage(tokens int) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	rl.tokenUsage += tokens
+
+	// Update token history
+	rl.tokenHistory = append(rl.tokenHistory, tokens)
+	if len(rl.tokenHistory) > rl.maxHistory {
+		rl.tokenHistory = rl.tokenHistory[1:]
+	}
 }
 
 // GetWaitTime returns how long to wait before next request
@@ -87,12 +119,30 @@ func (rl *RateLimiter) GetWaitTime(estimatedTokens int) time.Duration {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// If we can proceed immediately, return 0
-	if rl.tokenUsage+estimatedTokens <= rl.tokenLimit {
+	// Calculate average token usage from history
+	avgTokens := 0
+	if len(rl.tokenHistory) > 0 {
+		total := 0
+		for _, tokens := range rl.tokenHistory {
+			total += tokens
+		}
+		avgTokens = total / len(rl.tokenHistory)
+	}
+
+	// Use the larger of estimated tokens or average historical usage
+	expectedTokens := estimatedTokens
+	if avgTokens > estimatedTokens {
+		expectedTokens = avgTokens
+	}
+
+	// Add buffer to be more conservative
+	buffer := (rl.tokenLimit * rl.bufferPercent) / 100
+	effectiveLimit := rl.tokenLimit - buffer
+
+	if rl.tokenUsage+expectedTokens <= effectiveLimit {
 		return 0
 	}
 
-	// Calculate time until next reset
 	nextReset := rl.lastReset.Add(rl.resetInterval)
 	return time.Until(nextReset)
 }
@@ -253,6 +303,8 @@ Note: With the summary provide to and from IP addresses and ports that might be 
 
 Also don't call these network snapshots, just say "the network"
 
+Also, if you have an IP in the summary try to find more information on it. 
+
 Data Filter Format:
 Use a simple filter language that can match:
 - IP addresses (e.g., "ip:192.168.1.1")
@@ -321,6 +373,7 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 	if !s.rateLimiter.CanProceed(estimatedTokens) {
 		waitTime := s.rateLimiter.GetWaitTime(estimatedTokens)
 		if waitTime > 0 {
+			log.Printf("Rate limit approaching, waiting %v before next request", waitTime)
 			time.Sleep(waitTime)
 		}
 	}
@@ -373,6 +426,7 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 			}
 			if err := json.Unmarshal(body, &rateLimitError); err == nil {
 				s.rateLimiter.UpdateUsage(estimatedTokens)
+				log.Printf("Rate limit hit, updating token usage: %d", estimatedTokens)
 			}
 		}
 		return nil, fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
@@ -406,6 +460,10 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 
 	// Update token usage with actual count
 	s.rateLimiter.UpdateUsage(openAIResp.Usage.TotalTokens)
+	if s.debug {
+		log.Printf("Updated token usage: %d (total this minute: %d)",
+			openAIResp.Usage.TotalTokens, s.rateLimiter.tokenUsage)
+	}
 
 	// Parse the AI's response into our structured format
 	var aiResponse AIResponse
@@ -429,11 +487,15 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 
 	if err := json.Unmarshal([]byte(content), &aiResponse); err != nil {
 		log.Printf("Failed to parse content: %s", content)
+		// Reset the system prompt when we encounter parsing errors
+		s.sendSystemPrompt()
 		return nil, fmt.Errorf("error parsing AI response content: %v", err)
 	}
 
 	// Validate the parsed response
 	if len(aiResponse.Filters) == 0 && len(aiResponse.Anomalies) == 0 {
+		// Reset the system prompt when we get an empty response
+		s.sendSystemPrompt()
 		return nil, fmt.Errorf("empty response from AI")
 	}
 

@@ -1,34 +1,23 @@
-.PHONY: all build clean run linux-amd64
+.PHONY: all clean run
 
 # Variables
 BINARY_NAME=truffle
 GO=go
 GOFLAGS=-v
 LDFLAGS=-ldflags "-s -w"
+BIN_DIR=bin
 
-all: build
-
-build:
+all: $(BIN_DIR)
 	@echo "Building $(BINARY_NAME)..."
-	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_NAME) truffle.go
+	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BIN_DIR)/$(BINARY_NAME) .
 
-linux-amd64:
-	@echo "Building $(BINARY_NAME) for Linux amd64..."
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_NAME)-linux-amd64 truffle.go
+$(BIN_DIR):
+	@mkdir -p $(BIN_DIR)
 
 clean:
 	@echo "Cleaning build artifacts..."
-	rm -f $(BINARY_NAME)
-	rm -f $(BINARY_NAME)-linux-amd64
-	rm -f go.sum
-	rm -f go.mod
+	rm -rf $(BIN_DIR)
 
-run:
+run: all
 	@echo "Running $(BINARY_NAME)..."
-	./$(BINARY_NAME) -i en13 -k sk-svcacct-2NGdxpnJRKBSc3T6_oktsePfV0B0CmJVwXbsnX3G9NiRPVvld4YPQegREMsT3BlbkFJvnvox7XL7rS7ilPoG30cUFLavyWVXgWvWSL9MU2GqKInNA6F5xeaDya-DggA --debug-ai
-
-# Initialize Go module
-init:
-	@echo "Initializing Go module..."
-	$(GO) mod init truffle
-	$(GO) mod tidy 
+	./$(BIN_DIR)/$(BINARY_NAME) -i en13 -k sk-svcacct-2NGdxpnJRKBSc3T6_oktsePfV0B0CmJVwXbsnX3G9NiRPVvld4YPQegREMsT3BlbkFJvnvox7XL7rS7ilPoG30cUFLavyWVXgWvWSL9MU2GqKInNA6F5xeaDya-DggA --debug-ai
