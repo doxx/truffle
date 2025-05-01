@@ -27,6 +27,7 @@ func main() {
 	interfaceName := flag.String("i", "", "Network interface to capture on")
 	apiKey := flag.String("k", "", "OpenAI API key")
 	debug := flag.Bool("debug", false, "Enable debug output")
+	rollupInterval := flag.Int("t", 45, "Rollup interval in seconds")
 	flag.Parse()
 
 	if *interfaceName == "" {
@@ -64,7 +65,7 @@ func main() {
 	go state.displayRoutine()
 
 	// Start rollup goroutine
-	go state.rollupRoutine()
+	go state.rollupRoutine(*rollupInterval)
 
 	// Process packets
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
@@ -472,8 +473,8 @@ func (s *State) display() {
 	}
 }
 
-func (s *State) rollupRoutine() {
-	ticker := time.NewTicker(30 * time.Second)
+func (s *State) rollupRoutine(interval int) {
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	for range ticker.C {
 		s.mu.RLock()
 
