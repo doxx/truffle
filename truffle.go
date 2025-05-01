@@ -14,14 +14,16 @@ import (
 
 // Connection represents a network connection between two endpoints
 type Connection struct {
-	Endpoint1 string
-	Port1     uint16
-	Endpoint2 string
-	Port2     uint16
-	Count     int
-	Bytes     int64
-	FirstSeen time.Time
-	LastSeen  time.Time
+	Endpoint1        string
+	Port1            uint16
+	Port1IsEphemeral bool
+	Endpoint2        string
+	Port2            uint16
+	Port2IsEphemeral bool
+	Count            int
+	Bytes            int64
+	FirstSeen        time.Time
+	LastSeen         time.Time
 }
 
 // DNSRecord represents a DNS query/response
@@ -195,9 +197,26 @@ func extractSNI(payload []byte) (string, bool) {
 	return "", false
 }
 
+// isEphemeralPort returns true if the port is likely ephemeral
+func isEphemeralPort(port uint16) bool {
+	// Ports 49152-65535 are typically ephemeral
+	// Some systems use 32768-60999
+	return port >= 49152 || (port >= 32768 && port <= 60999)
+}
+
 // getCanonicalConnectionKey returns a consistent key for a connection regardless of direction
 func getCanonicalConnectionKey(srcIP string, srcPort uint16, dstIP string, dstPort uint16) string {
-	// Create two possible connection strings
+	srcIsEphemeral := isEphemeralPort(srcPort)
+	dstIsEphemeral := isEphemeralPort(dstPort)
+
+	// If one side is ephemeral and the other isn't, use the non-ephemeral port for ordering
+	if srcIsEphemeral && !dstIsEphemeral {
+		return fmt.Sprintf("%s:ephemeral-%s:%d", srcIP, dstIP, dstPort)
+	} else if !srcIsEphemeral && dstIsEphemeral {
+		return fmt.Sprintf("%s:%d-%s:ephemeral", srcIP, srcPort, dstIP)
+	}
+
+	// If both are ephemeral or both are not, use the original ordering
 	conn1 := fmt.Sprintf("%s:%d-%s:%d", srcIP, srcPort, dstIP, dstPort)
 	conn2 := fmt.Sprintf("%s:%d-%s:%d", dstIP, dstPort, srcIP, srcPort)
 
@@ -256,21 +275,28 @@ func (s *State) processPacket(packet gopacket.Packet) {
 	conn, exists := s.Connections[connKey]
 	if !exists {
 		// Create new connection with endpoints in canonical order
+		srcIsEphemeral := isEphemeralPort(srcPort)
+		dstIsEphemeral := isEphemeralPort(dstPort)
+
 		if connKey == fmt.Sprintf("%s:%d-%s:%d", srcIP, srcPort, dstIP, dstPort) {
 			conn = &Connection{
-				Endpoint1: srcIP,
-				Port1:     srcPort,
-				Endpoint2: dstIP,
-				Port2:     dstPort,
-				FirstSeen: time.Now(),
+				Endpoint1:        srcIP,
+				Port1:            srcPort,
+				Port1IsEphemeral: srcIsEphemeral,
+				Endpoint2:        dstIP,
+				Port2:            dstPort,
+				Port2IsEphemeral: dstIsEphemeral,
+				FirstSeen:        time.Now(),
 			}
 		} else {
 			conn = &Connection{
-				Endpoint1: dstIP,
-				Port1:     dstPort,
-				Endpoint2: srcIP,
-				Port2:     srcPort,
-				FirstSeen: time.Now(),
+				Endpoint1:        dstIP,
+				Port1:            dstPort,
+				Port1IsEphemeral: dstIsEphemeral,
+				Endpoint2:        srcIP,
+				Port2:            srcPort,
+				Port2IsEphemeral: srcIsEphemeral,
+				FirstSeen:        time.Now(),
 			}
 		}
 		s.Connections[connKey] = conn
@@ -386,8 +412,16 @@ func (s *State) display() {
 	fmt.Println("\n=== Network State ===")
 	fmt.Println("\nConnections:")
 	for _, conn := range s.Connections {
-		fmt.Printf("%s:%d <-> %s:%d (count: %d, bytes: %d, duration: %s)\n",
-			conn.Endpoint1, conn.Port1, conn.Endpoint2, conn.Port2,
+		port1 := fmt.Sprintf("%d", conn.Port1)
+		if conn.Port1IsEphemeral {
+			port1 = "ephemeral"
+		}
+		port2 := fmt.Sprintf("%d", conn.Port2)
+		if conn.Port2IsEphemeral {
+			port2 = "ephemeral"
+		}
+		fmt.Printf("%s:%s <-> %s:%s (count: %d, bytes: %d, duration: %s)\n",
+			conn.Endpoint1, port1, conn.Endpoint2, port2,
 			conn.Count, conn.Bytes, conn.LastSeen.Sub(conn.FirstSeen))
 	}
 
