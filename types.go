@@ -28,6 +28,8 @@ type Connection struct {
 type DNSRecord struct {
 	Query     string
 	Response  string
+	Type      string // Type of response (A, AAAA, NXDOMAIN, etc.)
+	Status    string // DNS response status (NOERROR, NXDOMAIN, etc.)
 	FirstSeen time.Time
 	LastSeen  time.Time
 }

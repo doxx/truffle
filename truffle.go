@@ -12,43 +12,6 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
-// Connection represents a network connection between two endpoints
-type Connection struct {
-	Endpoint1        string
-	Port1            uint16
-	Port1IsEphemeral bool
-	Endpoint2        string
-	Port2            uint16
-	Port2IsEphemeral bool
-	Count            int
-	Bytes            int64
-	FirstSeen        time.Time
-	LastSeen         time.Time
-}
-
-// DNSRecord represents a DNS query/response
-type DNSRecord struct {
-	Query     string
-	Response  string
-	FirstSeen time.Time
-	LastSeen  time.Time
-}
-
-// SNIRecord represents a TLS SNI record
-type SNIRecord struct {
-	Hostname  string
-	FirstSeen time.Time
-	LastSeen  time.Time
-}
-
-// NetworkRollup represents a rollup of network data
-type NetworkRollup struct {
-	Timestamp   time.Time
-	Connections []Connection
-	DNSRecords  []DNSRecord
-	SNIRecords  []SNIRecord
-}
-
 // State represents the current state of our network analysis
 type State struct {
 	Connections map[string]*Connection
@@ -107,7 +70,6 @@ func main() {
 	}
 }
 
-// isTLSHandshake checks if the payload contains a TLS handshake
 func isTLSHandshake(payload []byte) bool {
 	// Check if we have enough data for a TLS record header
 	if len(payload) < 5 {
@@ -132,7 +94,6 @@ func isTLSHandshake(payload []byte) bool {
 	return true
 }
 
-// extractSNI extracts the Server Name Indication from a TLS handshake
 func extractSNI(payload []byte) (string, bool) {
 	// Skip TLS record header (5 bytes)
 	handshakeStart := 5
@@ -219,14 +180,12 @@ func extractSNI(payload []byte) (string, bool) {
 	return "", false
 }
 
-// isEphemeralPort returns true if the port is likely ephemeral
 func isEphemeralPort(port uint16) bool {
 	// Ports 49152-65535 are typically ephemeral
 	// Some systems use 32768-60999
 	return port >= 49152 || (port >= 32768 && port <= 60999)
 }
 
-// getCanonicalConnectionKey returns a consistent key for a connection regardless of direction
 func getCanonicalConnectionKey(srcIP string, srcPort uint16, dstIP string, dstPort uint16) string {
 	srcIsEphemeral := isEphemeralPort(srcPort)
 	dstIsEphemeral := isEphemeralPort(dstPort)
@@ -249,7 +208,6 @@ func getCanonicalConnectionKey(srcIP string, srcPort uint16, dstIP string, dstPo
 	return conn2
 }
 
-// processPacket handles each captured packet
 func (s *State) processPacket(packet gopacket.Packet) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -332,26 +290,37 @@ func (s *State) processPacket(packet gopacket.Packet) {
 	if dnsLayer != nil {
 		dns, _ := dnsLayer.(*layers.DNS)
 		if dns.QR { // This is a response
-			for _, answer := range dns.Answers {
-				if answer.Type == layers.DNSTypeA || answer.Type == layers.DNSTypeAAAA {
-					query := string(dns.Questions[0].Name)
-					var response string
-					if answer.Type == layers.DNSTypeA {
-						response = answer.IP.String()
-					} else if answer.Type == layers.DNSTypeAAAA {
-						response = answer.IP.String()
-					}
-					dnsKey := fmt.Sprintf("%s-%s", query, response)
-					record, exists := s.DNSRecords[dnsKey]
-					if !exists {
-						record = &DNSRecord{
-							Query:     query,
-							Response:  response,
-							FirstSeen: time.Now(),
+			query := string(dns.Questions[0].Name)
+			status := dns.ResponseCode.String()
+
+			// Create a DNS record for the query regardless of response type
+			dnsKey := fmt.Sprintf("%s-%s", query, status)
+			record, exists := s.DNSRecords[dnsKey]
+			if !exists {
+				record = &DNSRecord{
+					Query:     query,
+					Response:  status, // For NXDOMAIN, this will be "NXDOMAIN"
+					Type:      dns.Questions[0].Type.String(),
+					Status:    status,
+					FirstSeen: time.Now(),
+				}
+				s.DNSRecords[dnsKey] = record
+			}
+			record.LastSeen = time.Now()
+
+			// If we have answers, process them
+			if len(dns.Answers) > 0 {
+				for _, answer := range dns.Answers {
+					if answer.Type == layers.DNSTypeA || answer.Type == layers.DNSTypeAAAA {
+						var response string
+						if answer.Type == layers.DNSTypeA {
+							response = answer.IP.String()
+						} else if answer.Type == layers.DNSTypeAAAA {
+							response = answer.IP.String()
 						}
-						s.DNSRecords[dnsKey] = record
+						// Update the record with the actual response
+						record.Response = response
 					}
-					record.LastSeen = time.Now()
 				}
 			}
 		}
@@ -380,7 +349,6 @@ func (s *State) processPacket(packet gopacket.Packet) {
 	}
 }
 
-// cleanupRoutine periodically cleans up old entries
 func (s *State) cleanupRoutine() {
 	ticker := time.NewTicker(30 * time.Second)
 	for range ticker.C {
@@ -388,7 +356,6 @@ func (s *State) cleanupRoutine() {
 	}
 }
 
-// displayRoutine periodically displays the current state
 func (s *State) displayRoutine() {
 	ticker := time.NewTicker(30 * time.Second)
 	for range ticker.C {
@@ -396,7 +363,6 @@ func (s *State) displayRoutine() {
 	}
 }
 
-// cleanup removes entries older than 30 seconds
 func (s *State) cleanup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -404,9 +370,17 @@ func (s *State) cleanup() {
 	now := time.Now()
 	threshold := now.Add(-30 * time.Second)
 
+	// Track counts before cleanup
+	originalConnections := len(s.Connections)
+	originalDNS := len(s.DNSRecords)
+	originalSNI := len(s.SNIRecords)
+
 	// Cleanup connections
 	for key, conn := range s.Connections {
 		if conn.LastSeen.Before(threshold) {
+			log.Printf("Aging out connection: %s:%d <-> %s:%d (last seen: %s)",
+				conn.Endpoint1, conn.Port1, conn.Endpoint2, conn.Port2,
+				conn.LastSeen.Format(time.RFC3339))
 			delete(s.Connections, key)
 		}
 	}
@@ -414,6 +388,8 @@ func (s *State) cleanup() {
 	// Cleanup DNS records
 	for key, record := range s.DNSRecords {
 		if record.LastSeen.Before(threshold) {
+			log.Printf("Aging out DNS record: %s (last seen: %s)",
+				record.Query, record.LastSeen.Format(time.RFC3339))
 			delete(s.DNSRecords, key)
 		}
 	}
@@ -421,12 +397,30 @@ func (s *State) cleanup() {
 	// Cleanup SNI records
 	for key, record := range s.SNIRecords {
 		if record.LastSeen.Before(threshold) {
+			log.Printf("Aging out SNI record: %s (last seen: %s)",
+				record.Hostname, record.LastSeen.Format(time.RFC3339))
 			delete(s.SNIRecords, key)
 		}
 	}
+
+	// Log cleanup results
+	if originalConnections != len(s.Connections) {
+		log.Printf("Aged out %d connections: %d -> %d",
+			originalConnections-len(s.Connections),
+			originalConnections, len(s.Connections))
+	}
+	if originalDNS != len(s.DNSRecords) {
+		log.Printf("Aged out %d DNS records: %d -> %d",
+			originalDNS-len(s.DNSRecords),
+			originalDNS, len(s.DNSRecords))
+	}
+	if originalSNI != len(s.SNIRecords) {
+		log.Printf("Aged out %d SNI records: %d -> %d",
+			originalSNI-len(s.SNIRecords),
+			originalSNI, len(s.SNIRecords))
+	}
 }
 
-// display shows the current state
 func (s *State) display() {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -448,17 +442,21 @@ func (s *State) display() {
 	}
 
 	fmt.Println("\nDNS Records:")
+	// Aggregate DNS queries by count
+	dnsCounts := make(map[string]int)
 	for _, record := range s.DNSRecords {
-		fmt.Printf("Query: %s -> Response: %s\n", record.Query, record.Response)
+		dnsCounts[record.Query]++
+	}
+	for query, count := range dnsCounts {
+		fmt.Printf("%s %d\n", query, count)
 	}
 
 	fmt.Println("\nSNI Records:")
 	for _, record := range s.SNIRecords {
-		fmt.Printf("Hostname: %s\n", record.Hostname)
+		fmt.Printf("%s\n", record.Hostname)
 	}
 }
 
-// rollupRoutine periodically collects and sends data to the AI
 func (s *State) rollupRoutine() {
 	ticker := time.NewTicker(30 * time.Second)
 	for range ticker.C {
