@@ -402,13 +402,18 @@ func (s *State) display() {
 	}
 
 	fmt.Println("\nDNS Records:")
+	// Aggregate DNS queries by count
+	dnsCounts := make(map[string]int)
 	for _, record := range s.DNSRecords {
-		fmt.Printf("Query: %s -> Response: %s\n", record.Query, record.Response)
+		dnsCounts[record.Query]++
+	}
+	for query, count := range dnsCounts {
+		fmt.Printf("%s %d\n", query, count)
 	}
 
 	fmt.Println("\nSNI Records:")
 	for _, record := range s.SNIRecords {
-		fmt.Printf("Hostname: %s\n", record.Hostname)
+		fmt.Printf("%s\n", record.Hostname)
 	}
 }
 

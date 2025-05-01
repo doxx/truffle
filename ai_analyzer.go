@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -18,6 +19,7 @@ type AISession struct {
 	mu            sync.RWMutex
 	lastPrompt    time.Time
 	promptCounter int
+	filterManager *FilterManager
 }
 
 // AIResponse represents the AI's analysis of our network data
@@ -38,8 +40,9 @@ type AIResponse struct {
 // NewAISession creates a new AI analysis session
 func NewAISession(apiKey string) *AISession {
 	return &AISession{
-		apiKey:      apiKey,
-		chatHistory: make([]map[string]string, 0),
+		apiKey:        apiKey,
+		chatHistory:   make([]map[string]string, 0),
+		filterManager: NewFilterManager(),
 	}
 }
 
@@ -58,6 +61,9 @@ func (s *AISession) analysisLoop(rollupChan <-chan NetworkRollup) {
 
 // processRollup handles a single rollup of network data
 func (s *AISession) processRollup(rollup NetworkRollup) {
+	// Apply filters before formatting
+	s.filterManager.ApplyFilters(&rollup)
+
 	// Format the rollup data
 	formattedData := s.formatRollup(rollup)
 
@@ -76,7 +82,7 @@ func (s *AISession) processRollup(rollup NetworkRollup) {
 		return
 	}
 
-	// Process the response (just log for now)
+	// Process the response
 	s.processResponse(response)
 }
 
@@ -244,7 +250,7 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 
 	// Prepare the request
 	requestBody := map[string]interface{}{
-		"model":    "gpt-4",
+		"model":    "gpt-4o",
 		"messages": s.chatHistory,
 	}
 
@@ -271,7 +277,15 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("error reading response: %v", err)
+		return nil, fmt.Errorf("error reading response body: %v", err)
+	}
+
+	// Log the raw response for debugging
+	log.Printf("OpenAI Response Status: %d", resp.StatusCode)
+	log.Printf("OpenAI Response Body: %s", string(body))
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var openAIResp struct {
@@ -280,20 +294,51 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 
 	if err := json.Unmarshal(body, &openAIResp); err != nil {
-		return nil, fmt.Errorf("error parsing response: %v", err)
+		return nil, fmt.Errorf("error parsing OpenAI response: %v", err)
+	}
+
+	if openAIResp.Error.Message != "" {
+		return nil, fmt.Errorf("OpenAI API error: %s", openAIResp.Error.Message)
 	}
 
 	if len(openAIResp.Choices) == 0 {
-		return nil, fmt.Errorf("no response from OpenAI")
+		return nil, fmt.Errorf("no choices in OpenAI response")
 	}
 
 	// Parse the AI's response into our structured format
 	var aiResponse AIResponse
-	if err := json.Unmarshal([]byte(openAIResp.Choices[0].Message.Content), &aiResponse); err != nil {
-		return nil, fmt.Errorf("error parsing AI response: %v", err)
+	content := openAIResp.Choices[0].Message.Content
+
+	// Remove markdown code block formatting if present
+	if strings.HasPrefix(content, "```json") {
+		content = strings.TrimPrefix(content, "```json")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	}
+
+	// Validate JSON structure
+	if !json.Valid([]byte(content)) {
+		// Try to fix common JSON issues
+		content = strings.ReplaceAll(content, ",\n}", "\n}")
+		content = strings.ReplaceAll(content, ",}", "}")
+		content = strings.ReplaceAll(content, ",\n]", "\n]")
+		content = strings.ReplaceAll(content, ",]", "]")
+	}
+
+	if err := json.Unmarshal([]byte(content), &aiResponse); err != nil {
+		log.Printf("Failed to parse content: %s", content)
+		return nil, fmt.Errorf("error parsing AI response content: %v", err)
+	}
+
+	// Validate the parsed response
+	if len(aiResponse.Filters) == 0 && len(aiResponse.Anomalies) == 0 {
+		return nil, fmt.Errorf("empty response from AI")
 	}
 
 	// Add the AI's response to chat history
@@ -307,13 +352,15 @@ func (s *AISession) sendToOpenAI(data string) (*AIResponse, error) {
 	return &aiResponse, nil
 }
 
-// processResponse handles the AI's response (just logging for now)
+// processResponse handles the AI's response and applies filters
 func (s *AISession) processResponse(response *AIResponse) {
 	log.Println("\n=== AI Analysis ===")
 	log.Println("Filters:")
 	for _, filter := range response.Filters {
 		log.Printf("- %s (TTL: %d minutes)\n  Reason: %s",
 			filter.Rule, filter.TTL, filter.Reason)
+		// Add the filter to our filter manager
+		s.filterManager.AddFilter(filter.Rule, filter.Reason, filter.TTL)
 	}
 
 	log.Println("\nAnomalies:")
