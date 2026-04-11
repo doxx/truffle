@@ -144,18 +144,26 @@ func (rl *RateLimiter) GetWaitTime(estimatedTokens int) time.Duration {
 	}
 
 	nextReset := rl.lastReset.Add(rl.resetInterval)
-	return time.Until(nextReset)
+	waitTime := time.Until(nextReset)
+
+	// Add 10 second padding to ensure we don't trip the limits
+	return waitTime + 10*time.Second
 }
 
-// NewAISession creates a new AI analysis session
-func NewAISession(apiKey string, debug bool) *AISession {
+// NewOpenAIAnalyzer creates a new OpenAI analyzer
+func NewOpenAIAnalyzer(apiKey string) (Analyzer, error) {
 	return &AISession{
 		apiKey:        apiKey,
 		chatHistory:   make([]map[string]string, 0),
-		filterManager: NewFilterManager(debug),
-		debug:         debug,
+		filterManager: NewFilterManager(false),
+		debug:         false,
 		rateLimiter:   NewRateLimiter(30000, time.Minute), // 30k tokens per minute limit
-	}
+	}, nil
+}
+
+// GetAnalysisType returns the type of analyzer
+func (s *AISession) GetAnalysisType() string {
+	return "openai"
 }
 
 // StartAnalysis starts the AI analysis loop
@@ -167,12 +175,12 @@ func (s *AISession) StartAnalysis(rollupChan <-chan NetworkRollup) {
 func (s *AISession) analysisLoop(rollupChan <-chan NetworkRollup) {
 	for rollup := range rollupChan {
 		// Process the rollup asynchronously
-		go s.processRollup(rollup)
+		go s.ProcessRollup(rollup)
 	}
 }
 
-// processRollup handles a single rollup of network data
-func (s *AISession) processRollup(rollup NetworkRollup) {
+// ProcessRollup handles a single rollup of network data
+func (s *AISession) ProcessRollup(rollup NetworkRollup) {
 	// Apply filters before formatting
 	s.filterManager.ApplyFilters(&rollup)
 
@@ -299,11 +307,15 @@ Your job is to:
 4. Provide evidence for your decisions
 5. Maintain context across analysis cycles
 
-Note: With the summary provide to and from IP addresses and ports that might be related to the issue. For example if it's a bad dns host, what host did that query.
+Note: 
+With the summary provide to and from IP addresses and ports that might be related to the issue. For example if it's a bad dns host, what host did that query.
 
-Also don't call these network snapshots, just say "the network"
+Don't call these network snapshots, just say "the network"
 
-Also, if you have an IP in the summary try to find more information on it. 
+If you have an IP in the summary try to find more information on it. 
+
+Only flag on major issues. Keep an eye on data transfers. 
+
 
 Data Filter Format:
 Use a simple filter language that can match:

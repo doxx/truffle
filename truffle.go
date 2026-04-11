@@ -22,12 +22,17 @@ type State struct {
 	debug       bool
 }
 
+var (
+	interfaceName  = flag.String("i", "", "Network interface to capture on")
+	apiKey         = flag.String("k", "", "OpenAI API key")
+	debug          = flag.Bool("debug", false, "Enable debug output")
+	rollupInterval = flag.Int("t", 45, "Rollup interval in seconds")
+	analyzerType   = flag.String("analyzer", "openai", "Type of analyzer to use (openai or local)")
+	modelPath      = flag.String("model-path", "", "Path to local model (required for local analyzer)")
+)
+
 func main() {
 	// Parse command line flags
-	interfaceName := flag.String("i", "", "Network interface to capture on")
-	apiKey := flag.String("k", "", "OpenAI API key")
-	debug := flag.Bool("debug", false, "Enable debug output")
-	rollupInterval := flag.Int("t", 45, "Rollup interval in seconds")
 	flag.Parse()
 
 	if *interfaceName == "" {
@@ -47,9 +52,30 @@ func main() {
 		debug:       *debug,
 	}
 
-	// Initialize AI session
-	aiSession := NewAISession(*apiKey, *debug)
-	aiSession.StartAnalysis(state.rollupChan)
+	// Create analyzer based on type
+	var analyzer Analyzer
+	var err error
+
+	switch *analyzerType {
+	case "openai":
+		analyzer, err = NewOpenAIAnalyzer(*apiKey)
+	case "local":
+		if *modelPath == "" {
+			log.Fatal("model-path is required when using local analyzer")
+		}
+		analyzer, err = NewLocalAnalyzer(*modelPath)
+	default:
+		log.Fatalf("Unknown analyzer type: %s", *analyzerType)
+	}
+
+	if err != nil {
+		log.Fatalf("Failed to create analyzer: %v", err)
+	}
+
+	log.Printf("Using %s analyzer", analyzer.GetAnalysisType())
+
+	// Start analysis
+	analyzer.StartAnalysis(state.rollupChan)
 
 	// Start packet capture
 	handle, err := pcap.OpenLive(*interfaceName, 1600, true, pcap.BlockForever)

@@ -2,6 +2,18 @@ package main
 
 import "time"
 
+// Analyzer defines the interface for network analysis
+type Analyzer interface {
+	// StartAnalysis begins the analysis process
+	StartAnalysis(rollupChan <-chan NetworkRollup)
+
+	// ProcessRollup handles a single rollup of network data
+	ProcessRollup(rollup NetworkRollup)
+
+	// GetAnalysisType returns the type of analyzer (e.g., "openai", "local")
+	GetAnalysisType() string
+}
+
 // NetworkRollup represents a rollup of network data
 type NetworkRollup struct {
 	Timestamp   time.Time
